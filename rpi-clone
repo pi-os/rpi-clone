@@ -7,8 +7,10 @@
 # the rpi-clone github source repository:
 #    https://github.com/billw2/rpi-clone
 
+version=2.0.25
 
-version=2.0.22
+# prefix debug statements with line numbers when -x is used 
+declare -r PS4='|${LINENO}> \011${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
 
 # setup trusted paths for dependancies (like rsync, grub, fdisk, etc)
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -27,18 +29,15 @@ then
     exit 1
 fi
 
-raspbian=0
-raspbian_buster=0
-if [ -f /etc/os-release ]
-then
-	pretty=`cat /etc/os-release | grep PRETTY`
-	if [[ "$pretty" == *"Raspbian"* ]]
-	then
-		raspbian=1
+rpios=0
+rpios_recent=0
+if [ -f /etc/os-release ]; then
+	if [[ -e /etc/rpi-issue ]]; then
+		rpios=1
 	fi
-	if ((raspbian)) && [[ "$pretty" == *"buster"* ]]
-	then
-		raspbian_buster=1
+	pretty="$(cat /etc/os-release | grep PRETTY)"
+	if ((rpios)) && [[ ! "$pretty" =~ wheezy|jessie|stretch ]]; then
+		rpios_recent=1
 	fi
 fi
 
@@ -155,12 +154,12 @@ usage: $PGM sdN {-v|--verbose} {-f|--force-initialize} {-f2}
   Clones can be from a booted SD card or USB disk.  For a description, example
   clone runs and example usage of above options, see the README.md at:
 
-      https://github.com/billw2/rpi-clone
+      https://github.com/pi-os/rpi-clone
 
   A line logging a $PGM run is written to $clone_log.
 
   Download:
-    git clone https://github.com/billw2/rpi-clone
+    git clone https://github.com/pi-os/rpi-clone
 "
 	exit 1
 	}
@@ -224,7 +223,7 @@ qecho()
     	echo "$@"
     fi
 	}
-	
+
 qprintf()
 	{
     if ((!quiet))
@@ -265,6 +264,10 @@ unmount_list()
 		then
 			qecho "  Failed to unmount: $dir"
 		fi
+		if ! rmdir $dir
+		then
+			qecho "  Failed to rmdir: $dir"
+		fi
 	done
 	}
 
@@ -290,6 +293,19 @@ rsync_file_system()
 	dst_dir="$2"
 
 	qprintf "  => rsync $1 $2 $3 ..."
+
+	# make sure the partition is mounted
+	# sometimes it happens on RPi5 /boot is no longer mounted and then
+	# the cloned boot partition will be empty
+	if ! findmnt "$src_dir" &>/dev/null; then
+		if ! mount "$src_dir"; then
+			echo "??? Remount failure of $1."
+			echo "Aborting!"
+			exit 1
+		else
+			qecho "  Remounting $1"
+		fi
+	fi
 
 	if [ "$3" == "with-root-excludes" ]
 	then
@@ -573,7 +589,7 @@ get_src_disk()
 	partition=${1#/dev/}
 	disk=${partition:: -1}
 	num="${partition: -1}"
-	if [[ $disk == *"mmcblk"* ]]
+	if [[ $disk == *"mmcblk"* || $disk == *"nvme"* ]]
 	then
 		SD_slot_boot=1
 		disk=${disk:0:7}
@@ -748,7 +764,6 @@ do
 		fi
 	fi
 done
-
 
 # command line
 #
@@ -942,6 +957,13 @@ then
     exit 1
 fi
 
+# Starting with bookworm /boot/firmware/cmdline.txt is used. All previous RaspbianOS releases use /boot/cmdline.txt
+cmdlinedir=$(mount | awk '$3 ~ "^/boot(/firmware)?$" && $5 == "vfat" { print substr($3, 2); exit }' )
+if [[ -z "$cmdlinedir" ]]; then
+	echo "Unable to locate boot device"
+	exit 1
+fi
+
 if ((convert_to_partuuid))
 then
 	unattended=0
@@ -957,6 +979,10 @@ then
 	count=0
 	for ((p = 1; p <= n_src_parts; p++))
 	do
+		if ((!src_exists[p]))
+		then
+			continue
+		fi
 		if grep -q "^/dev/${src_partition[p]}" $fstab_tmp
 		then
 			partuuid=$(lsblk -n -o PARTUUID /dev/${src_partition[p]})
@@ -971,7 +997,7 @@ then
 		cp $fstab_tmp $fstab
 		printf "Your original fstab is backed up to $fstab_save\n"
 
-		cmdline_txt=/boot/cmdline.txt
+		cmdline_txt=/${cmdlinedir}/cmdline.txt
 		cmdline_save=$cmdline_txt.${PGM}-save
 		if [ -f $cmdline_txt ] && grep -q "$src_root_dev" $cmdline_txt
 		then
@@ -1059,7 +1085,7 @@ dst_part_base=$dst_disk
 
 if [[ ${chk_disk: -1} =~ ^[0-9]$ ]]
 then
-	if [[ $dst_disk == *"mmcblk"* ]]
+	if [[ $dst_disk == *"mmcblk"* || $dst_disk == *"nvme"* ]]
 	then
 		SD_slot_dst=1
 		dst_part_base=${dst_disk}p
@@ -1320,7 +1346,7 @@ Use -U for unattended even if initializing.
 		then
 			printf "%-22s : %s\n" " " \
 						"Possible options:"
-			if ((raspbian))
+			if ((rpios))
 			then
 				printf "%-22s : %s\n" " " \
 						"    Use -f2 to force a two partition initialize clone."
@@ -1338,14 +1364,14 @@ Use -U for unattended even if initializing.
 
 	readable_MiB $((last_part_sectors + 7812)) "512" image_space_readable
 
-	echo "== Initialize: IMAGE partition table - $reason ==" 
+	echo "== Initialize: IMAGE partition table - $reason =="
 	print_image_actions
 	print_options
 
 	printf "%-22s : %s\n" "** WARNING **" \
 			"All destination disk $dst_disk data will be overwritten!"
 
-	if ((raspbian_buster && p1_size_new == 0 && src_size_sectors[1] < 400000))
+	if ((rpios_recent && p1_size_new == 0 && src_size_sectors[1] < 400000))
 	then
 		printf "%-22s : %s\n" "** WARNING **" \
 			"Your source /boot partition is smaller than the"
@@ -1530,7 +1556,7 @@ Use -U for unattended even if initializing.
 						else
 							src_sync_part[p]=1
 						fi
-					fi					
+					fi
 				else
 					printf "  => dd if=${src_device[$p]} of=$dst_dev bs=1M ..."
 					dd if=${src_device[$p]} of=$dst_dev bs=1M &>> /tmp/$PGM-output
@@ -1606,7 +1632,7 @@ else
 		exit 1
 	fi
 
-	if ((raspbian_buster && dst_size_sectors[1] < 500000))
+	if ((rpios_recent && dst_size_sectors[1] < 500000))
 	then
 		qprintf "%-22s : %s\n" "** WARNING **" \
 			"Your destination /boot partition is smaller than the"
@@ -1730,15 +1756,15 @@ qecho ""
 # Fix PARTUUID or device name references in cmdline.txt and fstab
 #
 fstab=${clone}/etc/fstab
-cmdline_txt=${clone}/boot/cmdline.txt
+cmdline_txt=${clone}/${cmdlinedir}/cmdline.txt
 
 if [ -f $cmdline_txt ]
 then
 	if ((leave_sd_usb_boot && SD_slot_dst))
 	then
 		qecho "Leaving SD to USB boot alone."
-		cp $cmdline_txt ${clone}/boot/cmdline.boot
-		cmdline_txt=${clone}/boot/cmdline.boot
+		cp $cmdline_txt ${clone}/${cmdlinedir}/cmdline.boot
+		cmdline_txt=${clone}/${cmdlinedir}/cmdline.boot
 	fi
 	if grep -q $src_disk_ID $cmdline_txt
 	then
@@ -1752,8 +1778,8 @@ then
 	if ((leave_sd_usb_boot && SD_slot_boot))
 	then
 		qecho "Copying USB cmdline.txt to SD card to set up USB boot."
-		cp /boot/cmdline.txt /boot/cmdline.boot
-		cp $cmdline_txt /boot/cmdline.txt
+		cp /${cmdlinedir}/cmdline.txt /${cmdlinedir}/cmdline.boot
+		cp $cmdline_txt /${cmdlinedir}/cmdline.txt
 	fi
 fi
 
@@ -1766,7 +1792,6 @@ then
 	qecho "Editing $fstab references from $src_part_base to $edit_fstab_name"
 	sed -i "s/${src_part_base}/${edit_fstab_name}/" "$fstab"
 fi
-
 
 rm -f $clone/etc/udev/rules.d/70-persistent-net.rules
 
@@ -1814,7 +1839,7 @@ qprintf "   Start - %s    End - %s    Elapsed Time - %d:%02d\n" \
 if ((!unattended))
 then
 	echo -n $"
-Cloned partitions are mounted on $clone for inspection or customizing. 
+Cloned partitions are mounted on $clone for inspection or customizing.
 
 Hit Enter when ready to unmount the /dev/$dst_disk partitions ..."
 
